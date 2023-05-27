@@ -5,9 +5,6 @@ import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-
-
-
 class DownsampleLayer(nn.Module):
     def __init__(self,in_ch,out_ch):
         super(DownsampleLayer, self).__init__()
@@ -54,12 +51,13 @@ class SpatialAttention(nn.Module):
         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):  # x.size() 30,40,50,30
+    def forward(self, x):
+        res = x
         avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)  # 30,1,50,30
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
         x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)  # 30,1,50,30
-        return self.sigmoid(x)  # 30,1,50,30
+        x = self.conv1(x)
+        return self.sigmoid(x)*res
 
 class MSAB(nn.Module):
     def __init__(self):
@@ -113,8 +111,8 @@ class Attention(nn.Module):
         ) if project_out else nn.Identity()
 
     def forward(self, x):
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
@@ -202,20 +200,44 @@ class WindowAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+    
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
 
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
 
+class bottleneck(nn.Module):
+    def __init__(self, dim, depth, heads, mlp_ratio, dropout = 0.):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        self.dim_head = dim // heads
+        self.mlp_dim = int(dim * mlp_ratio)
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm(dim, Attention(dim, heads=heads, dim_head=self.dim_head, dropout = dropout)),
+                PreNorm(dim, FeedForward(dim, self.mlp_dim, dropout=dropout))
+            ]))
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+        return x
 
 class DPTB(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
@@ -232,10 +254,9 @@ class DPTB(nn.Module):
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn1 = Attention(dim, heads = num_heads, dim_head = dim // num_heads, dropout = drop)
+        self.attn1 = Attention(dim, heads=num_heads, dim_head=dim // num_heads, dropout=drop)
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
@@ -270,7 +291,7 @@ class DPTB(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x, x1):
+    def forward(self, x, x1, linear):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -278,9 +299,7 @@ class DPTB(nn.Module):
         if self.shift_size == 0:
             shortcut1 = x1
             x1 = self.norm1(x1)
-            x1 = x1.view(B, H, W, C)
             x1 = self.attn1(x1)
-            x1 = x1.view(B, H * W, C)
 
         shortcut = x
         x = self.norm1(x)
@@ -315,6 +334,7 @@ class DPTB(nn.Module):
         if self.shift_size == 0:
             x1 = shortcut1 + self.drop_path(x1)
             x = torch.cat([x, x1], -1)
+            x = linear(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
@@ -322,20 +342,6 @@ class DPTB(nn.Module):
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
 
 
 
@@ -413,12 +419,12 @@ class DecoderBlock(nn.Module):
         else:
             self.upsample = None
 
-    def forward(self, x, x1):
+    def forward(self, x, x1, linear):
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, x1)
             else:
-                x = blk(x, x1)
+                x = blk(x, x1, linear)
         if self.upsample is not None:
             x = self.upsample(x)
         return x
@@ -449,12 +455,6 @@ class PatchEmbed(nn.Module):
             x = self.norm(x)
         return x
 
-    def flops(self):
-        Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
 
 
 class Net(nn.Module):
@@ -503,19 +503,11 @@ class Net(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         # build bottleneck layers
-        self.layers = DecoderBlock(dim=int(embed_dim * 2 ** 3),
-                               input_resolution=(patches_resolution[0] // (2 ** 3),
-                                                 patches_resolution[1] // (2 ** 3)),
-                               depth=depths[3],
-                               num_heads=num_heads[3],
-                               window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
-                               qkv_bias=qkv_bias, qk_scale=qk_scale,
-                               drop=drop_rate, attn_drop=attn_drop_rate,
-                               drop_path=dpr[sum(depths[:3]):sum(depths[:3 + 1])],
-                               norm_layer=norm_layer,
-                               downsample=None,
-                               use_checkpoint=use_checkpoint)
+        self.layers = bottleneck(dim=int(embed_dim * 2 ** 3),
+                                 depth=depths[3],
+                                 heads=num_heads[3],
+                                 mlp_ratio=self.mlp_ratio,
+                                 dropout=0.)
 
         
         # build decoder layers
@@ -577,14 +569,13 @@ class Net(nn.Module):
         residual = x
         x_downsample_cnn = []
 
-
-
         x, cnn_down = self.cnnencoder(x)
         for i in range(3):
             cnn_down[i] = self.MSAB(cnn_down[i])
             x_downsample_cnn.append(self.patch_embed_cnn[i](cnn_down[i]))
 
-        x = self.layers(self.patch_embed(x))
+        x = self.patch_embed(x)
+        x = self.layers(x)
         x = self.norm(x)  # B L C
   
         return residual, x, x_downsample_cnn
@@ -595,7 +586,7 @@ class Net(nn.Module):
             if inx == 0:
                 x = layer_up(x)
             else:
-                x = layer_up(x, x_downsample_cnn[3-inx])
+                x = layer_up(x, x_downsample_cnn[3-inx], self.concat_back_dim[inx])
         x = self.norm_up(x)  # B L C
   
         return x
