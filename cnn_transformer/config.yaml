@@ -1,8 +1,4 @@
 # Training configuration
-GPU: [0,1]
-
-VERBOSE: False
-
 MyNET:
   IMG_SIZE: 64
   PATCH_SIZE: 4
