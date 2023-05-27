@@ -4,12 +4,12 @@ from .cnn_transformer_detail import Net
 
 
 class MyNet(nn.Module):
-    def __init__(self, config, zero_head=False):
+    def __init__(self, config):
         super(MyNet, self).__init__()
-        self.zero_head = zero_head
         self.config = config
 
-        self.net = Net( patch_size=config['MyNet']['PATCH_SIZE'],
+        self.net = Net( img_size=config['MyNet']['IMG_SIZE'],
+                        patch_size=config['MyNet']['PATCH_SIZE'],
                         in_chans=1,
                         embed_dim=config['MyNet']['EMB_DIM'],
                         depths=config['MyNet']['DEPTH_EN'],
